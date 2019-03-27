@@ -18,6 +18,9 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import torch.nn.functional as F
+
+from util import mixup_data, mixup_criterion
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -74,6 +77,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('--alpha', default=0.7, type=float, help='interpolation strength (uniform=1., ERM=0.)')
 
 best_acc1 = 0
 
@@ -167,11 +171,18 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    cel = nn.CrossEntropyLoss()
+    criterion = lambda pred, target, lam: (-F.log_softmax(pred, dim=1) * torch.zeros(pred.size()).cuda().scatter_(1, target.data.view(-1, 1), lam.view(-1, 1))).sum(dim=1).mean()
+    parameters_bias = [p[1] for p in model.named_parameters() if 'bias' in p[0]]
+    parameters_scale = [p[1] for p in model.named_parameters() if 'scale' in p[0]]
+    parameters_others = [p[1] for p in model.named_parameters() if not ('bias' in p[0] or 'scale' in p[0])]
+    optimizer = torch.optim.SGD(
+        [{'params': parameters_bias, 'lr': args.lr/10.},
+        {'params': parameters_scale, 'lr': args.lr/10.},
+        {'params': parameters_others}],
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -239,7 +250,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, cel, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -267,23 +278,25 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (input, target) in enumerate(train_loader):
+    for i, (inputs, targets) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            input = input.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+        inputs = inputs.cuda(args.gpu, non_blocking=True)
+        targets = targets.cuda(args.gpu, non_blocking=True)
+
+        inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, args.alpha, use_cuda=True)
 
         # compute output
-        output = model(input)
-        loss = criterion(output, target)
+        output = model(inputs)
+        loss_func = mixup_criterion(targets_a, targets_b, lam)
+        loss = loss_func(criterion, output)
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), input.size(0))
-        top1.update(acc1[0], input.size(0))
-        top5.update(acc5[0], input.size(0))
+        acc1, acc5 = accuracy(output, targets, topk=(1, 5))
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(acc1[0], inputs.size(0))
+        top5.update(acc5[0], inputs.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
