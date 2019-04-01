@@ -19,6 +19,7 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from util import mixup_data, mixup_criterion
 
@@ -45,8 +46,8 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
-                    metavar='LR', help='initial learning rate', dest='lr')
+parser.add_argument('--base_lr', default=0.1, type=float,
+                    metavar='base_lr', help='base learning rate (default=0.1)', dest='base_lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
@@ -80,11 +81,11 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--alpha', default=0.7, type=float, help='interpolation strength (uniform=1., ERM=0.)')
 
 best_acc1 = 0
-
+args = parser.parse_args()
+base_learning_rate = args.base_lr * args.batch_size / 256.
+# base_learning_rate *= torch.cuda.device_count()
 
 def main():
-    args = parser.parse_args()
-
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -177,10 +178,10 @@ def main_worker(gpu, ngpus_per_node, args):
     parameters_scale = [p[1] for p in model.named_parameters() if 'scale' in p[0]]
     parameters_others = [p[1] for p in model.named_parameters() if not ('bias' in p[0] or 'scale' in p[0])]
     optimizer = torch.optim.SGD(
-        [{'params': parameters_bias, 'lr': args.lr/10.},
-        {'params': parameters_scale, 'lr': args.lr/10.},
+        [{'params': parameters_bias, 'lr': args.base_lr/10.},
+        {'params': parameters_scale, 'lr': args.base_lr/10.},
         {'params': parameters_others}],
-        lr=args.lr,
+        lr=base_learning_rate,
         momentum=args.momentum,
         weight_decay=args.weight_decay)
 
@@ -241,6 +242,7 @@ def main_worker(gpu, ngpus_per_node, args):
         validate(val_loader, model, criterion, args)
         return
 
+    sgdr = CosineAnnealingLR(optimizer, args.epochs, eta_min=0, last_epoch=-1)
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -388,10 +390,20 @@ class AverageMeter(object):
 
 
 def adjust_learning_rate(optimizer, epoch, args):
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 30))
+    # """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    # lr = args.base_lr * (0.1 ** (epoch // 30))
+    #     for param_group in optimizer.param_groups:
+    #     param_group['lr'] = lr
+
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        if param_group['initial_lr'] == base_learning_rate:
+            print("adjust non-scalar lr.")
+            lr = base_learning_rate * (0.1 ** (epoch // 30))
+            param_group['lr'] = lr
+        else:
+            print("adjust scalar lr.")
+            scalar_lr = param_group['initial_lr'] * (0.1 ** (epoch // 30))
+            param_group['lr'] = scalar_lr
 
 
 def accuracy(output, target, topk=(1,)):
